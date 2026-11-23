@@ -56,21 +56,28 @@ create index if not exists messages_conversation_created_idx
 create index if not exists conversations_updated_idx
   on public.conversations(updated_at desc);
 
--- Helper checks membership using the caller's authenticated identity.
-create or replace function public.is_conversation_member(target_conversation uuid)
+-- A narrowly scoped membership helper avoids recursive RLS policy evaluation.
+-- It returns only a boolean for the current caller and exposes no membership rows.
+create schema if not exists private;
+revoke all on schema private from public;
+grant usage on schema private to authenticated;
+
+create or replace function private.is_conversation_member(target_conversation uuid)
 returns boolean
 language sql
 stable
-security invoker
+security definer
 set search_path = ''
-as $$
+as $
   select exists (
     select 1
     from public.conversation_members cm
     where cm.conversation_id = target_conversation
       and cm.user_id = (select auth.uid())
   );
-$$;
+$;
+revoke all on function private.is_conversation_member(uuid) from public;
+grant execute on function private.is_conversation_member(uuid) to authenticated;
 
 alter table public.profiles enable row level security;
 alter table public.conversations enable row level security;
@@ -95,7 +102,7 @@ create policy "Users can update their profile"
 drop policy if exists "Members can view conversations" on public.conversations;
 create policy "Members can view conversations"
   on public.conversations for select to authenticated
-  using (public.is_conversation_member(id));
+  using (private.is_conversation_member(id));
 drop policy if exists "Authenticated users can create conversations" on public.conversations;
 create policy "Authenticated users can create conversations"
   on public.conversations for insert to authenticated
@@ -105,23 +112,30 @@ create policy "Authenticated users can create conversations"
 drop policy if exists "Members can view conversation membership" on public.conversation_members;
 create policy "Members can view conversation membership"
   on public.conversation_members for select to authenticated
-  using (public.is_conversation_member(conversation_id));
+  using (private.is_conversation_member(conversation_id));
 drop policy if exists "Users can add themselves to a conversation" on public.conversation_members;
 create policy "Users can add themselves to a conversation"
   on public.conversation_members for insert to authenticated
-  with check ((select auth.uid()) = user_id);
+  with check (
+    (select auth.uid()) = user_id
+    and exists (
+      select 1 from public.conversations c
+      where c.id = conversation_id
+        and c.created_by = (select auth.uid())
+    )
+  );
 
 -- Only members can read messages; only the sender may create their own message.
 drop policy if exists "Members can read messages" on public.messages;
 create policy "Members can read messages"
   on public.messages for select to authenticated
-  using (public.is_conversation_member(conversation_id));
+  using (private.is_conversation_member(conversation_id));
 drop policy if exists "Members can send messages as themselves" on public.messages;
 create policy "Members can send messages as themselves"
   on public.messages for insert to authenticated
   with check (
     (select auth.uid()) = sender_id
-    and public.is_conversation_member(conversation_id)
+    and private.is_conversation_member(conversation_id)
   );
 drop policy if exists "Senders can edit their messages" on public.messages;
 create policy "Senders can edit their messages"
@@ -129,7 +143,7 @@ create policy "Senders can edit their messages"
   using ((select auth.uid()) = sender_id)
   with check (
     (select auth.uid()) = sender_id
-    and public.is_conversation_member(conversation_id)
+    and private.is_conversation_member(conversation_id)
   );
 
 -- Create a profile automatically when a new phone-OTP user is registered.
